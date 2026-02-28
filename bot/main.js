@@ -10,21 +10,42 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import NodeCache from 'node-cache';
+import { exec } from 'child_process';
+import util from 'util';
 import axios from 'axios';
 import publicIp from 'public-ip';
+
+const execPromise = util.promisify(exec);
 
 // ============= KONFIGURASI =============
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SESSION_DIR = 'sessions';
+const OLLAMA_MODEL = 'Qwen3:0.6b'; // Model 0.5B (ringan)
 
 // Cache
 const msgRetryCounterCache = new NodeCache();
 const logger = pino({ level: 'silent' });
-
-// Cache untuk data kontak
 const contactCache = new Map();
 const ipCache = new Map();
+
+// Anti-block configuration
+const CONFIG = {
+    MESSAGE_DELAY: 2000,
+    GROUP_MESSAGE_DELAY: 3000,
+    MAX_MESSAGES_PER_MINUTE: 30,
+    USER_COOLDOWN: 5000,
+    AUTO_READ: true,
+    MARK_ONLINE: true,
+    RECONNECT_DELAY: 5000
+};
+
+// Cache untuk cooldown
+const userCooldown = new Map();
+const messageCounter = {
+    count: 0,
+    resetTime: Date.now() + 60000
+};
 
 // ============= FUNGSI DAPATKAN IP PUBLIK =============
 async function getPublicIP() {
@@ -39,12 +60,10 @@ async function getPublicIP() {
 // ============= FUNGSI DAPATKAN GEOLOKASI DARI IP =============
 async function getGeoLocation(ip) {
     try {
-        // Cek cache dulu
         if (ipCache.has(ip)) {
             return ipCache.get(ip);
         }
 
-        // Pake ipapi.co (gratis, tanpa API key)
         const response = await axios.get(`https://ipapi.co/${ip}/json/`);
         
         if (response.data && !response.data.error) {
@@ -58,14 +77,12 @@ async function getGeoLocation(ip) {
                 timezone: response.data.timezone || 'Unknown'
             };
             
-            // Simpan ke cache
             ipCache.set(ip, geoData);
             return geoData;
         }
         
         return null;
     } catch (error) {
-        console.error('❌ Error get geolocation:', error.message);
         return null;
     }
 }
@@ -86,29 +103,33 @@ function formatGeoLocation(geo) {
 // ============= FUNGSI DAPATKAN NAMA KONTAK =============
 async function getContactName(sock, jid) {
     try {
-        // Cek cache dulu
         if (contactCache.has(jid)) {
             return contactCache.get(jid);
         }
 
         let name = 'Unknown';
         
-        // Untuk personal chat
         if (jid.endsWith('@s.whatsapp.net')) {
-            const contact = await sock.fetchContact(jid);
-            name = contact?.name || contact?.notify || contact?.verifiedName || jid.split('@')[0];
+            const [number] = jid.split('@');
+            try {
+                const contact = await sock.fetchContact(jid);
+                name = contact?.name || contact?.notify || contact?.verifiedName || number;
+            } catch {
+                name = number;
+            }
         }
-        // Untuk group
         else if (jid.endsWith('@g.us')) {
-            const groupMetadata = await sock.groupMetadata(jid);
-            name = groupMetadata.subject || 'Unknown Group';
+            try {
+                const groupMetadata = await sock.groupMetadata(jid);
+                name = groupMetadata.subject || 'Unknown Group';
+            } catch {
+                name = 'Unknown Group';
+            }
         }
         
-        // Simpan ke cache
         contactCache.set(jid, name);
         return name;
     } catch (error) {
-        console.error('Error get contact name:', error.message);
         return jid.split('@')[0];
     }
 }
@@ -141,68 +162,137 @@ function getFormattedTime() {
 }
 
 // ============= FUNGSI LOG PESAN LENGKAP =============
-async function logMessageDetails(sock, msg, messageContent, isGroup) {
+async function logMessageDetails(sock, msg, messageContent, isGroup, response = null) {
     try {
         const jid = msg.key.remoteJid;
         const sender = msg.key.participant || jid;
         const senderNumber = sender.split('@')[0];
         
-        // Dapatkan nama kontak
         const contactName = await getContactName(sock, jid);
-        
-        // Dapatkan waktu
         const waktu = getFormattedTime();
-        
-        // Dapatkan IP publik bot (bukan IP user)
         const botIP = await getPublicIP();
-        
-        // Dapatkan geolokasi dari IP bot
         const geoLocation = await getGeoLocation(botIP);
         
-        // Tampilkan di konsol dengan format menarik
-        console.log('\n' + '='.repeat(80));
+        console.log('\n' + '═'.repeat(80));
         console.log(`📱 DETAIL PESAN MASUK [${waktu.full}]`);
-        console.log('='.repeat(80));
+        console.log('═'.repeat(80));
         
-        // Info Kontak
         console.log(`👤 KONTAK:`);
         console.log(`   • Nama: ${contactName}`);
-        console.log(`   • JID: ${jid}`);
         console.log(`   • Nomor: ${senderNumber}`);
         console.log(`   • Tipe: ${isGroup ? 'Grup' : 'Personal'}`);
         
-        // Info Pesan
         console.log(`\n💬 PESAN:`);
-        console.log(`   • Isi: ${messageContent || '[Non-text message]'}`);
-        console.log(`   • Panjang: ${messageContent?.length || 0} karakter`);
+        console.log(`   • Isi: ${messageContent || '[Media/Non-text]'}`);
         console.log(`   • Waktu: ${waktu.time}`);
         console.log(`   • Tanggal: ${waktu.date}`);
         
-        // Info IP Bot
         console.log(`\n🖥️  SERVER:`);
         console.log(`   • IP Publik: ${botIP}`);
         
-        // Info Geolokasi (dari IP bot)
         if (geoLocation) {
             console.log(`\n${formatGeoLocation(geoLocation)}`);
-        } else {
-            console.log(`\n🌍 Geolokasi: Gagal mendapatkan data`);
         }
         
-        // Info tambahan
-        console.log(`\n📊 METADATA:`);
-        console.log(`   • Message ID: ${msg.key.id}`);
-        console.log(`   • From Me: ${msg.key.fromMe ? 'Ya' : 'Tidak'}`);
-        console.log(`   • Type: ${Object.keys(msg.message || {})[0] || 'Unknown'}`);
+        if (response) {
+            console.log(`\n🤖 RESPON AI:`);
+            console.log(`   • ${response.substring(0, 100)}${response.length > 100 ? '...' : ''}`);
+            console.log(`   • Panjang: ${response.length} karakter`);
+        }
         
-        console.log('='.repeat(80) + '\n');
+        console.log('\n' + '═'.repeat(80) + '\n');
         
         return { contactName, waktu, botIP, geoLocation };
         
     } catch (error) {
-        console.error('❌ Error logging message:', error.message);
+        console.error('❌ Error logging:', error.message);
     }
 }
+
+// ============= FUNGSI CEK OLLAMA =============
+async function checkOllama() {
+    try {
+        const { stdout } = await execPromise('ollama list');
+        if (stdout.includes(OLLAMA_MODEL)) {
+            return { status: true, message: `✅ Model ${OLLAMA_MODEL} tersedia` };
+        } else {
+            return { 
+                status: false, 
+                message: `❌ Model ${OLLAMA_MODEL} tidak ditemukan\nInstall: ollama pull ${OLLAMA_MODEL}` 
+            };
+        }
+    } catch (error) {
+        return { 
+            status: false, 
+            message: '❌ Ollama tidak terinstall atau tidak berjalan' 
+        };
+    }
+}
+
+// ============= FUNGSI GENERATE AI DENGAN EXEC =============
+async function generateAIResponse(prompt) {
+    try {
+        console.log(`🤔 AI Memproses: "${prompt.substring(0, 50)}..."`);
+        
+        const escapedPrompt = prompt.replace(/"/g, '\\"');
+        
+        const { stdout, stderr } = await execPromise(
+            `ollama run ${OLLAMA_MODEL} "${escapedPrompt}"`,
+            { timeout: 30000 }
+        );
+        
+        if (stderr) {
+            console.error('⚠️ Ollama stderr:', stderr);
+        }
+        
+        return stdout.trim() || '❌ Tidak ada respons dari AI';
+        
+    } catch (error) {
+        console.error('❌ Error Ollama:', error.message);
+        
+        if (error.message.includes('timeout')) {
+            return '❌ AI terlalu lama merespons. Coba pertanyaan yang lebih sederhana.';
+        }
+        if (error.message.includes('not found')) {
+            return '❌ Ollama tidak ditemukan. Pastikan Ollama sudah terinstall.';
+        }
+        return '❌ Maaf, terjadi error. Coba lagi nanti.';
+    }
+}
+
+// ============= FUNGSI CEK COOLDOWN =============
+function checkCooldown(userId) {
+    const now = Date.now();
+    const lastCommand = userCooldown.get(userId) || 0;
+    
+    if (now - lastCommand < CONFIG.USER_COOLDOWN) {
+        const remaining = Math.ceil((CONFIG.USER_COOLDOWN - (now - lastCommand)) / 1000);
+        return { allowed: false, remaining };
+    }
+    
+    userCooldown.set(userId, now);
+    return { allowed: true, remaining: 0 };
+}
+
+// ============= FUNGSI CEK RATE LIMIT =============
+function checkRateLimit() {
+    const now = Date.now();
+    
+    if (now > messageCounter.resetTime) {
+        messageCounter.count = 0;
+        messageCounter.resetTime = now + 60000;
+    }
+    
+    if (messageCounter.count >= CONFIG.MAX_MESSAGES_PER_MINUTE) {
+        return false;
+    }
+    
+    messageCounter.count++;
+    return true;
+}
+
+// ============= FUNGSI DELAY =============
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ============= FUNGSI KONEKSI WHATSAPP =============
 async function connectToWhatsApp() {
@@ -222,11 +312,12 @@ async function connectToWhatsApp() {
         },
         printQRInTerminal: false,
         logger: logger,
-        browser: ['Bot Logger', 'Chrome', '1.0.0'],
+        browser: ['Bot AI Logger', 'Chrome', '1.0.0'],
         version: version,
         syncFullHistory: false,
         msgRetryCounterCache,
-        defaultQueryTimeoutMs: 60000
+        defaultQueryTimeoutMs: 60000,
+        markOnlineOnConnect: CONFIG.MARK_ONLINE
     });
 
     // Handle QR Code
@@ -242,20 +333,22 @@ async function connectToWhatsApp() {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            
             if (shouldReconnect) {
-                console.log('❌ Koneksi terputus, reconnect dalam 3 detik...');
-                setTimeout(() => connectToWhatsApp(), 3000);
+                console.log(`❌ Koneksi terputus, reconnect dalam ${CONFIG.RECONNECT_DELAY/1000} detik...`);
+                setTimeout(() => connectToWhatsApp(), CONFIG.RECONNECT_DELAY);
             }
         } else if (connection === 'open') {
-            console.log('\n✅ BOT LOGGER BERHASIL TERHUBUNG!');
-            console.log('📝 Mode: Logging Lengkap');
-            console.log('📝 Setiap pesan masuk akan ditampilkan detailnya di konsol\n');
+            console.log('\n✅ BOT AI LOGGER BERHASIL TERHUBUNG!');
+            console.log(`🤖 Model AI: ${OLLAMA_MODEL}`);
+            console.log('📝 Command: .ai [pertanyaan]');
+            console.log('📝 Setiap pesan akan dilog dengan detail lengkap\n');
             
-            // Tampilkan IP bot saat connect
             const botIP = await getPublicIP();
             const geo = await getGeoLocation(botIP);
-            console.log('🖥️  INFORMASI SERVER BOT:');
+            console.log('🖥️  INFORMASI SERVER:');
             console.log(`   • IP: ${botIP}`);
             if (geo) {
                 console.log(`   • Lokasi: ${geo.city}, ${geo.country}`);
@@ -270,27 +363,111 @@ async function connectToWhatsApp() {
     // Handler pesan
     sock.ev.on('messages.upsert', async ({ messages }) => {
         for (let msg of messages) {
-            if (!msg.message || msg.key?.remoteJid === 'status@broadcast') continue;
-            
-            // Ambil teks pesan
-            let messageContent = '';
-            if (msg.message?.conversation) {
-                messageContent = msg.message.conversation;
-            } else if (msg.message?.extendedTextMessage?.text) {
-                messageContent = msg.message.extendedTextMessage.text;
-            } else {
-                messageContent = '[Media/Non-text message]';
-            }
+            try {
+                if (!msg.message || msg.key?.remoteJid === 'status@broadcast') continue;
+                if (msg.key?.fromMe) continue;
 
-            const jid = msg.key.remoteJid;
-            const isGroup = jid.endsWith('@g.us');
+                let messageContent = '';
+                if (msg.message?.conversation) {
+                    messageContent = msg.message.conversation;
+                } else if (msg.message?.extendedTextMessage?.text) {
+                    messageContent = msg.message.extendedTextMessage.text;
+                }
 
-            // Log detail pesan
-            await logMessageDetails(sock, msg, messageContent, isGroup);
-            
-            // Auto-read pesan
-            if (!msg.key.fromMe) {
-                await sock.readMessages([msg.key]);
+                const jid = msg.key.remoteJid;
+                const isGroup = jid.endsWith('@g.us');
+
+                // Auto-read
+                if (CONFIG.AUTO_READ && !msg.key.fromMe) {
+                    await sock.readMessages([msg.key]);
+                }
+
+                // Log pesan masuk (tanpa response dulu)
+                if (messageContent) {
+                    await logMessageDetails(sock, msg, messageContent, isGroup);
+                }
+
+                // Proses command
+                if (messageContent && messageContent.startsWith('.')) {
+                    
+                    // Cek rate limit
+                    if (!checkRateLimit()) {
+                        console.log('⚠️ Rate limit exceeded');
+                        continue;
+                    }
+
+                    const command = messageContent.split(' ')[0].toLowerCase();
+                    const args = messageContent.substring(command.length).trim();
+
+                    // Command .ai
+                    if (command === '.ai') {
+                        // Cek cooldown
+                        const cooldown = checkCooldown(jid);
+                        if (!cooldown.allowed) {
+                            await sock.sendMessage(jid, { 
+                                text: `⏳ Tunggu ${cooldown.remaining} detik` 
+                            });
+                            continue;
+                        }
+
+                        if (!args) {
+                            await sock.sendMessage(jid, { 
+                                text: '❌ Format: .ai [pertanyaan]' 
+                            });
+                            continue;
+                        }
+
+                        if (args.toLowerCase() === 'status') {
+                            const ollamaStatus = await checkOllama();
+                            await sock.sendMessage(jid, { 
+                                text: `📊 *STATUS AI*\n\n${ollamaStatus.message}` 
+                            });
+                            continue;
+                        }
+
+                        // Proses AI
+                        await sock.sendPresenceUpdate('composing', jid);
+                        await delay(1000);
+                        
+                        await sock.sendMessage(jid, { text: '⏳ Memproses...' });
+
+                        const startTime = Date.now();
+                        const aiResponse = await generateAIResponse(args);
+                        const processTime = ((Date.now() - startTime) / 1000).toFixed(1);
+
+                        await delay(1000);
+
+                        // Kirim response
+                        const responseText = `*🧠 AI ${OLLAMA_MODEL}* (${processTime}s)\n\n${aiResponse}`;
+                        await sock.sendMessage(jid, { text: responseText });
+
+                        // Log response
+                        console.log(`✅ Respon AI terkirim (${processTime}s)`);
+                        
+                        // Update log dengan response
+                        await logMessageDetails(sock, msg, messageContent, isGroup, aiResponse);
+                    }
+
+                    // Command .help
+                    if (command === '.help') {
+                        const helpText = `*🤖 BOT AI LOGGER*\n\n` +
+                            `*Model:* ${OLLAMA_MODEL}\n` +
+                            `*Command:*\n` +
+                            `• .ai [tanya] - Tanya AI\n` +
+                            `• .ai status - Cek status\n` +
+                            `• .help - Bantuan\n\n` +
+                            `*Fitur:*\n` +
+                            `• Log nama kontak\n` +
+                            `• Log waktu & tanggal\n` +
+                            `• Log IP server\n` +
+                            `• Log geolokasi`;
+                        
+                        await sock.sendMessage(jid, { text: helpText });
+                    }
+                }
+
+            } catch (error) {
+                console.error('❌ Error handler:', error.message);
             }
         }
     });
@@ -301,17 +478,29 @@ async function connectToWhatsApp() {
 // ============= FUNGSI UTAMA =============
 async function main() {
     console.log('='.repeat(80));
-    console.log('🤖 BOT WHATSAPP LOGGER - LENGKAP DENGAN GEOLOKASI');
+    console.log('🤖 BOT WHATSAPP AI + LOGGER LENGKAP');
     console.log('='.repeat(80));
     
-    // Tampilan awal
-    console.log('\n📋 FITUR LOGGING:');
-    console.log('   ✓ Nama kontak');
-    console.log('   ✓ Isi pesan');
-    console.log('   ✓ Waktu (jam & tanggal)');
-    console.log('   ✓ IP publik bot');
-    console.log('   ✓ Geolokasi dari IP (negara, kota, ISP)');
-    console.log('   ✓ Metadata pesan\n');
+    console.log('\n📋 FITUR:');
+    console.log('   ✓ AI Qwen2.5 0.5B (ringan & cepat)');
+    console.log('   ✓ Log nama kontak');
+    console.log('   ✓ Log isi pesan');
+    console.log('   ✓ Log waktu (jam & tanggal)');
+    console.log('   ✓ Log IP server');
+    console.log('   ✓ Log geolokasi dari IP');
+    console.log('   ✓ Anti-block system\n');
+    
+    console.log('🔍 Memeriksa Ollama...');
+    const ollamaStatus = await checkOllama();
+    console.log(ollamaStatus.message);
+    
+    if (!ollamaStatus.status) {
+        console.log('\n⚠️  Install Ollama dan model:');
+        console.log('   curl -fsSL https://ollama.com/install.sh | sh');
+        console.log(`   ollama pull ${OLLAMA_MODEL}\n`);
+    }
+
+    console.log('\n🔄 Menghubungkan ke WhatsApp...\n');
     
     try {
         await connectToWhatsApp();
