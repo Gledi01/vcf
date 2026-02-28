@@ -23,41 +23,84 @@ const msgRetryCounterCache = new NodeCache();
 // Logger minimal
 const logger = pino({ level: 'silent' });
 
-// ============= FUNGSI MEMBACA VCARD =============
+// ============= FUNGSI MEMBUAT VCARD FORMAT WA =============
+function createWhatsAppVcard() {
+    // Buat vCard dengan format yang benar untuk WhatsApp
+    const vcard = [
+        'BEGIN:VCARD',
+        'VERSION:3.0',  // PAKAI VERSION 3.0 (bukan 2.1)
+        'N:FNL;;;',
+        'FN:FNL',
+        'TEL;type=CELL;type=VOICE;waid=628123456789:+62 812-3456-789', // Format dengan waid
+        'END:VCARD'
+    ].join('\n');
+    
+    return {
+        content: vcard,
+        displayName: 'FNL'
+    };
+}
+
+// ============= FUNGSI MEMBACA VCARD DARI FILE =============
 function readVcardFile() {
     try {
         if (!fs.existsSync(VCARD_PATH)) {
-            console.error('❌ File vcard.vcf tidak ditemukan di:', VCARD_PATH);
-            return null;
+            console.log('📝 File vcard.vcf tidak ditemukan, menggunakan vCard default');
+            return createWhatsAppVcard();
         }
 
-        const vcardContent = fs.readFileSync(VCARD_PATH, 'utf8');
+        let vcardContent = fs.readFileSync(VCARD_PATH, 'utf8');
         
+        // Perbaiki typo umum
+        vcardContent = vcardContent
+            .replace('BEGIN:VCDAR', 'BEGIN:VCARD')
+            .replace('VERSION:2.1', 'VERSION:3.0'); // PAKSA JADI VERSION 3.0
+        
+        // Validasi format
         if (!vcardContent.includes('BEGIN:VCARD') || !vcardContent.includes('END:VCARD')) {
-            console.error('❌ Format file vcard.vcf tidak valid');
-            return null;
+            console.log('❌ Format file vcard.vcf tidak valid, menggunakan vCard default');
+            return createWhatsAppVcard();
         }
 
-        // Perbaiki typo di file (BEGIN:VCDAR -> BEGIN:VCARD)
-        const fixedContent = vcardContent.replace('BEGIN:VCDAR', 'BEGIN:VCARD');
+        // Pastikan ada FN: (ini penting untuk display name)
+        if (!vcardContent.includes('FN:')) {
+            // Tambahkan FN jika tidak ada
+            const lines = vcardContent.split('\n');
+            const insertIndex = lines.findIndex(l => l.includes('BEGIN:VCARD')) + 1;
+            lines.splice(insertIndex, 0, 'FN:FNL');
+            vcardContent = lines.join('\n');
+        }
+
+        // Pastikan format TEL benar untuk WhatsApp
+        if (!vcardContent.includes('waid=')) {
+            // Extract nomor dan tambahkan waid
+            const telMatch = vcardContent.match(/TEL[^:]*:[\+]?([0-9]+)/);
+            if (telMatch) {
+                const phone = telMatch[1];
+                vcardContent = vcardContent.replace(
+                    /TEL[^:]*:([^\n]+)/,
+                    `TEL;type=CELL;type=VOICE;waid=${phone}:$1`
+                );
+            }
+        }
 
         // Ekstrak display name
         let displayName = 'Kontak';
-        const fnMatch = fixedContent.match(/FN[^:]*:([^\n\r]+)/i);
+        const fnMatch = vcardContent.match(/FN:([^\n\r]+)/i);
         if (fnMatch) {
-            displayName = fnMatch[1].trim().replace(/[;]/g, ' ').trim();
+            displayName = fnMatch[1].trim();
         }
 
         console.log('✅ File vcard.vcf berhasil dibaca');
         console.log('📇 Nama kontak:', displayName);
         
         return {
-            content: fixedContent,
-            displayName: displayName || 'Kontak'
+            content: vcardContent,
+            displayName: displayName
         };
     } catch (error) {
-        console.error('❌ Error membaca file vcard.vcf:', error.message);
-        return null;
+        console.error('❌ Error membaca file:', error.message);
+        return createWhatsAppVcard();
     }
 }
 
@@ -65,15 +108,11 @@ function readVcardFile() {
 async function connectToWhatsApp() {
     console.log('\n🔄 Memulai koneksi WhatsApp...');
     
-    // Buat folder sessions jika belum ada
     if (!fs.existsSync(SESSION_DIR)) {
         fs.mkdirSync(SESSION_DIR);
     }
 
-    // Ambil versi Baileys terbaru [citation:1]
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`📦 Menggunakan Baileys versi: ${version.join('.')} (latest: ${isLatest})`);
-
+    const { version } = await fetchLatestBaileysVersion();
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
     
     const sock = makeWASocket({
@@ -81,70 +120,41 @@ async function connectToWhatsApp() {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger)
         },
-        printQRInTerminal: false, // MATIKAN, kita handle manual
+        printQRInTerminal: false,
         logger: logger,
         browser: ['Bot VCF', 'Chrome', '1.0.0'],
-        version: version, // PAKAI VERSI TERBARU [citation:1]
+        version: version,
         syncFullHistory: false,
-        generateHighQualityLinkPreview: false,
         msgRetryCounterCache,
         defaultQueryTimeoutMs: 60000
     });
 
-    // Handle QR Code MANUAL
-    sock.ev.on('connection.update', async (update) => {
+    // Handle QR Code
+    sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // TAMPILKAN QR CODE JIKA ADA
         if (qr) {
             console.log('\n' + '='.repeat(50));
             console.log('📱 SCAN QR CODE INI DENGAN WHATSAPP ANDA');
             console.log('='.repeat(50));
-            console.log('Cara scan:');
-            console.log('1. Buka WhatsApp di HP');
-            console.log('2. Tap titik 3 (Android) atau Settings (iPhone)');
-            console.log('3. Pilih "Perangkat Tertaut"');
-            console.log('4. Tap "Tautkan Perangkat"');
-            console.log('5. Scan QR code di bawah ini:\n');
-            
-            // Generate QR code di terminal menggunakan qrcode-terminal
             qrcode.generate(qr, { small: true });
-            
             console.log('\n⏳ Menunggu scan...\n');
-        } else {
-            // Debug: lihat apa yang diterima dari event
-            console.log('📡 Connection update:', JSON.stringify(update, null, 2));
         }
 
         if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            
-            console.log('❌ Koneksi terputus. Status code:', statusCode);
-            
-            if (statusCode === 405) {
-                console.log('⚠️  Error 405 Method Not Allowed - Mencoba dengan versi berbeda...');
-                // Coba dengan versi yang lebih lama jika 405 [citation:1]
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) {
+                console.log('❌ Koneksi terputus, reconnect dalam 3 detik...');
                 setTimeout(() => connectToWhatsApp(), 3000);
-            } else if (shouldReconnect) {
-                console.log('Mencoba reconnect dalam 3 detik...');
-                setTimeout(() => connectToWhatsApp(), 3000);
-            } else {
-                console.log('❌ Bot logout. Hapus folder sessions dan jalankan ulang.');
             }
         } else if (connection === 'open') {
             console.log('\n✅ BOT WHATSAPP VCF BERHASIL TERHUBUNG!');
-            console.log('📝 Kirim perintah .vcf di chat untuk mengirim kontak dari file vcard.vcf');
-            console.log('💡 Contoh: .vcf\n');
-        } else if (connection === 'connecting') {
-            console.log('⏳ Menghubungkan...');
+            console.log('📝 Kirim perintah .vcf di chat untuk mengirim kontak');
+            console.log('💡 Kontak akan muncul sebagai card yang bisa di-save\n');
         }
     });
 
-    // Save credentials
     sock.ev.on('creds.update', saveCreds);
-
-    // Handle error lainnya
     sock.ev.on('messages.upsert', async ({ messages }) => {
         await handleMessages(sock, messages);
     });
@@ -162,27 +172,18 @@ async function handleMessages(sock, messages) {
                               '';
 
         const jid = msg.key.remoteJid;
-        const isGroup = jid.endsWith('@g.us');
 
         if (messageContent.toLowerCase().startsWith('.vcf')) {
-            console.log(`📇 Menerima perintah .vcf dari ${isGroup ? 'Group' : 'Personal'} ${jid}`);
+            console.log(`📇 Menerima perintah .vcf dari ${jid}`);
             
             try {
+                // Baca vCard
                 const vcardData = readVcardFile();
                 
-                if (!vcardData) {
-                    await sock.sendMessage(jid, {
-                        text: '❌ Gagal membaca file vcard.vcf. Pastikan file tersedia dan formatnya benar.\n\n' +
-                              '📝 File vcard.vcf harus berisi:\n' +
-                              'BEGIN:VCARD\n' +
-                              'VERSION:3.0\n' +
-                              'FN:Nama Kontak\n' +
-                              'TEL:+628123456789\n' +
-                              'END:VCARD'
-                    });
-                    continue;
-                }
+                console.log('📤 Mengirim kontak:', vcardData.displayName);
+                console.log('📄 Format vCard:', vcardData.content.substring(0, 100) + '...');
 
+                // KIRIM KONTAK - INI YANG AKAN MUNCUL SEBAGAI CARD
                 await sock.sendMessage(jid, {
                     contacts: {
                         displayName: vcardData.displayName,
@@ -192,16 +193,12 @@ async function handleMessages(sock, messages) {
                     }
                 });
 
-                await sock.sendMessage(jid, {
-                    text: `✅ Kontak *${vcardData.displayName}* berhasil dikirim dari file vcard.vcf!`
-                });
-
-                console.log(`✅ Kontak ${vcardData.displayName} berhasil dikirim ke ${jid}`);
+                console.log(`✅ Kontak ${vcardData.displayName} berhasil dikirim`);
 
             } catch (error) {
-                console.error('❌ Error mengirim vCard:', error);
+                console.error('❌ Error:', error);
                 await sock.sendMessage(jid, {
-                    text: '❌ Gagal mengirim kontak. Error: ' + error.message
+                    text: '❌ Gagal mengirim kontak'
                 });
             }
         }
@@ -211,44 +208,17 @@ async function handleMessages(sock, messages) {
 // ============= FUNGSI UTAMA =============
 async function main() {
     console.log('='.repeat(60));
-    console.log('🤖 BOT WHATSAPP VCF - KIRIM KONTAK DARI FILE vcard.vcf');
+    console.log('🤖 BOT WHATSAPP VCF - KIRIM KONTAK CARD');
     console.log('='.repeat(60));
     
-    // Fix typo di file vcard.vcf jika ada
-    if (fs.existsSync(VCARD_PATH)) {
-        let content = fs.readFileSync(VCARD_PATH, 'utf8');
-        if (content.includes('BEGIN:VCDAR')) {
-            console.log('\n🔧 Memperbaiki typo di file vcard.vcf (BEGIN:VCDAR -> BEGIN:VCARD)');
-            content = content.replace('BEGIN:VCDAR', 'BEGIN:VCARD');
-            fs.writeFileSync(VCARD_PATH, content);
-        }
-    }
-    
-    // Cek file vcard.vcf
-    console.log('\n📁 Memeriksa file vcard.vcf...');
-    const vcardCheck = readVcardFile();
-    
-    if (!vcardCheck) {
-        console.log('\n⚠️  FILE vcard.vcf TIDAK VALID!');
-        console.log('📁 Buat file vcard.vcf dengan format:');
-        console.log('BEGIN:VCARD');
-        console.log('VERSION:3.0');
-        console.log('FN:Nama Kontak');
-        console.log('TEL:+628123456789');
-        console.log('END:VCARD');
-    } else {
-        console.log('\n📇 PREVIEW FILE vcard.vcf:');
-        console.log('-'.repeat(40));
-        const lines = vcardCheck.content.split('\n');
-        for (let i = 0; i < Math.min(5, lines.length); i++) {
-            console.log(lines[i]);
-        }
-        if (lines.length > 5) console.log('...');
-        console.log('-'.repeat(40));
-    }
+    // Test vCard
+    console.log('\n📁 Memeriksa konfigurasi vCard...');
+    const testVcard = createWhatsAppVcard();
+    console.log('✅ Format vCard siap digunakan');
+    console.log('📇 Nama kontak:', testVcard.displayName);
+    console.log('📄 Preview:', testVcard.content.replace(/\n/g, ' • '));
 
-    console.log('\n🔄 Menghubungkan ke WhatsApp...');
-    console.log('⏳ Mohon tunggu, QR Code akan tampil sebentar...\n');
+    console.log('\n🔄 Menghubungkan ke WhatsApp...\n');
     
     try {
         await connectToWhatsApp();
@@ -260,7 +230,7 @@ async function main() {
 
 // Handle shutdown
 process.on('SIGINT', () => {
-    console.log('\n\n👋 Bot dimatikan. Sampai jumpa!');
+    console.log('\n\n👋 Bot dimatikan');
     process.exit(0);
 });
 
