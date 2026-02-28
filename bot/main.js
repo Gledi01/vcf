@@ -19,7 +19,7 @@ const execPromise = util.promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SESSION_DIR = 'sessions';
-const OLLAMA_MODEL = 'Qwen3:0.6b';
+const OLLAMA_MODEL = 'qwen3:0.6b';
 const LOG_FILE = 'bot-errors.log';
 
 // TIMEOUT 3 MENIT
@@ -566,7 +566,7 @@ async function connectToWhatsApp() {
                         await sock.sendMessage(jid, { text: statsMessage });
                     }
 
-                    // ===== COMMAND .HELP =====
+                    //                    // ===== COMMAND .HELP =====
                     if (command === '.help') {
                         const helpText = `*🤖 BOT QWEN3 AI*\n\n` +
                             `*Model:* ${OLLAMA_MODEL}\n` +
@@ -578,4 +578,86 @@ async function connectToWhatsApp() {
                             `• .help - Bantuan ini\n\n` +
                             `*Fitur:*\n` +
                             `✓ Log nama kontak\n` +
-                          
+                            `✓ Log waktu\n` +
+                            `✓ Anti-spam cooldown\n` +
+                            `✓ Anti-block system\n` +
+                            `✓ Monitoring error`;
+                        
+                        await sock.sendMessage(jid, { text: helpText });
+                    }
+                }
+
+            } catch (error) {
+                if (error.message?.includes('Bad MAC')) {
+                    errorStats.badMac++;
+                    errorStats.total++;
+                    logWarning(`Bad MAC di handler: ${error.message}`);
+                } else {
+                    logError('HANDLER_ERROR', error.message);
+                }
+            }
+        }
+    });
+
+    return sock;
+}
+
+// ============= FUNGSI UTAMA =============
+async function main() {
+    console.log('='.repeat(80));
+    console.log('🤖 BOT WHATSAPP + QWEN3 0.6B - VERSI LENGKAP');
+    console.log('='.repeat(80));
+    
+    console.log('\n📋 KONFIGURASI:');
+    console.log(`   • Model AI: ${OLLAMA_MODEL}`);
+    console.log(`   • Timeout AI: 3 menit (${OLLAMA_TIMEOUT/1000} detik)`);
+    console.log(`   • Delay pesan: ${CONFIG.MESSAGE_DELAY}ms`);
+    console.log(`   • Cooldown user: ${CONFIG.USER_COOLDOWN/1000}s`);
+    console.log(`   • Max pesan/menit: ${CONFIG.MAX_MESSAGES_PER_MINUTE}`);
+    console.log(`   • Auto-read: ${CONFIG.AUTO_READ ? 'Ya' : 'Tidak'}`);
+    console.log(`   • Log file: ${LOG_FILE}\n`);
+    
+    console.log('🔍 Memeriksa Ollama...');
+    const ollamaStatus = await checkOllama();
+    console.log(ollamaStatus.message);
+    
+    if (!ollamaStatus.status) {
+        console.log('\n⚠️  PERINGATAN: Ollama bermasalah!');
+        console.log(`📥 Install: ollama pull ${OLLAMA_MODEL}\n`);
+    }
+
+    console.log('\n🔄 Menghubungkan ke WhatsApp...\n');
+    
+    try {
+        await connectToWhatsApp();
+        
+        // Tampilkan stats setiap 30 menit
+        setInterval(() => {
+            if (errorStats.total > 0) {
+                showErrorStats();
+            }
+        }, 1800000);
+        
+    } catch (error) {
+        logError('FATAL_ERROR', error.message);
+        process.exit(1);
+    }
+}
+
+// Handle shutdown
+process.on('SIGINT', () => {
+    console.log('\n\n' + '='.repeat(60));
+    console.log('📊 STATISTIK ERROR FINAL');
+    console.log('='.repeat(60));
+    console.log(`🔴 Bad MAC Error    : ${errorStats.badMac}`);
+    console.log(`🔴 Connection Error : ${errorStats.connection}`);
+    console.log(`🔴 Ollama Error     : ${errorStats.ollama}`);
+    console.log(`📊 Total Error      : ${errorStats.total}`);
+    console.log(`⏱️  Timeout AI       : 3 menit`);
+    console.log('='.repeat(60));
+    console.log('\n📁 Log error:', LOG_FILE);
+    console.log('👋 Bot dimatikan\n');
+    process.exit(0);
+});
+
+main();
