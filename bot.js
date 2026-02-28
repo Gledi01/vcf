@@ -16,74 +16,35 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const VCARD_PATH = path.join(__dirname, 'vcard.vcf');
 const SESSION_DIR = 'sessions';
+const THUMB_PATH = path.join(__dirname, 'thumb.jpg'); // Letakkan file gambar thumbnail
 
-// Cache untuk performa lebih baik
+// Global variables
+global.ownername = 'FNL';
+global.owner = '628123456789'; // Nomor tanpa +
+
+// Cache untuk performa
 const msgRetryCounterCache = new NodeCache();
-
-// Logger minimal
 const logger = pino({ level: 'silent' });
 
-// ============= FUNGSI MEMBUAT VCARD FORMAT WA =============
-function createWhatsAppVcard() {
-    // Buat vCard dengan format yang benar untuk WhatsApp
-    const vcard = [
-        'BEGIN:VCARD',
-        'VERSION:3.0',  // PAKAI VERSION 3.0 (bukan 2.1)
-        'N:FNL;;;',
-        'FN:FNL',
-        'TEL;type=CELL;type=VOICE;waid=628123456789:+62 812-3456-789', // Format dengan waid
-        'END:VCARD'
-    ].join('\n');
-    
-    return {
-        content: vcard,
-        displayName: 'FNL'
-    };
+// ============= FUNGSI STYLES (CONTOH) =============
+function Styles(text) {
+    return text; // Anda bisa menambahkan styling di sini
 }
 
 // ============= FUNGSI MEMBACA VCARD DARI FILE =============
 function readVcardFile() {
     try {
         if (!fs.existsSync(VCARD_PATH)) {
-            console.log('📝 File vcard.vcf tidak ditemukan, menggunakan vCard default');
-            return createWhatsAppVcard();
+            return null;
         }
 
         let vcardContent = fs.readFileSync(VCARD_PATH, 'utf8');
         
-        // Perbaiki typo umum
+        // Fix umum
         vcardContent = vcardContent
             .replace('BEGIN:VCDAR', 'BEGIN:VCARD')
-            .replace('VERSION:2.1', 'VERSION:3.0'); // PAKSA JADI VERSION 3.0
+            .replace('VERSION:2.1', 'VERSION:3.0');
         
-        // Validasi format
-        if (!vcardContent.includes('BEGIN:VCARD') || !vcardContent.includes('END:VCARD')) {
-            console.log('❌ Format file vcard.vcf tidak valid, menggunakan vCard default');
-            return createWhatsAppVcard();
-        }
-
-        // Pastikan ada FN: (ini penting untuk display name)
-        if (!vcardContent.includes('FN:')) {
-            // Tambahkan FN jika tidak ada
-            const lines = vcardContent.split('\n');
-            const insertIndex = lines.findIndex(l => l.includes('BEGIN:VCARD')) + 1;
-            lines.splice(insertIndex, 0, 'FN:FNL');
-            vcardContent = lines.join('\n');
-        }
-
-        // Pastikan format TEL benar untuk WhatsApp
-        if (!vcardContent.includes('waid=')) {
-            // Extract nomor dan tambahkan waid
-            const telMatch = vcardContent.match(/TEL[^:]*:[\+]?([0-9]+)/);
-            if (telMatch) {
-                const phone = telMatch[1];
-                vcardContent = vcardContent.replace(
-                    /TEL[^:]*:([^\n]+)/,
-                    `TEL;type=CELL;type=VOICE;waid=${phone}:$1`
-                );
-            }
-        }
-
         // Ekstrak display name
         let displayName = 'Kontak';
         const fnMatch = vcardContent.match(/FN:([^\n\r]+)/i);
@@ -91,16 +52,13 @@ function readVcardFile() {
             displayName = fnMatch[1].trim();
         }
 
-        console.log('✅ File vcard.vcf berhasil dibaca');
-        console.log('📇 Nama kontak:', displayName);
-        
         return {
             content: vcardContent,
             displayName: displayName
         };
     } catch (error) {
-        console.error('❌ Error membaca file:', error.message);
-        return createWhatsAppVcard();
+        console.error('Error reading vcard:', error);
+        return null;
     }
 }
 
@@ -149,8 +107,7 @@ async function connectToWhatsApp() {
             }
         } else if (connection === 'open') {
             console.log('\n✅ BOT WHATSAPP VCF BERHASIL TERHUBUNG!');
-            console.log('📝 Kirim perintah .vcf di chat untuk mengirim kontak');
-            console.log('💡 Kontak akan muncul sebagai card yang bisa di-save\n');
+            console.log('📝 Commands: .vcf, .owner, .addprem');
         }
     });
 
@@ -172,35 +129,139 @@ async function handleMessages(sock, messages) {
                               '';
 
         const jid = msg.key.remoteJid;
+        const sender = msg.key.participant || jid;
+        const isGroup = jid.endsWith('@g.us');
 
-        if (messageContent.toLowerCase().startsWith('.vcf')) {
-            console.log(`📇 Menerima perintah .vcf dari ${jid}`);
-            
+        if (!messageContent.startsWith('.')) continue;
+
+        const command = messageContent.split(' ')[0].toLowerCase();
+        const args = messageContent.substring(command.length).trim();
+        
+        console.log(`📨 Command: ${command} dari ${jid}`);
+
+        // ============= COMMAND .VCF (DARI FILE) =============
+        if (command === '.vcf') {
             try {
-                // Baca vCard
                 const vcardData = readVcardFile();
                 
-                console.log('📤 Mengirim kontak:', vcardData.displayName);
-                console.log('📄 Format vCard:', vcardData.content.substring(0, 100) + '...');
+                if (!vcardData) {
+                    await sock.sendMessage(jid, { 
+                        text: '❌ File vcard.vcf tidak ditemukan!' 
+                    });
+                    return;
+                }
 
-                // KIRIM KONTAK - INI YANG AKAN MUNCUL SEBAGAI CARD
+                const kontak = {
+                    displayName: vcardData.displayName,
+                    vcard: vcardData.content
+                };
+
                 await sock.sendMessage(jid, {
                     contacts: {
-                        displayName: vcardData.displayName,
-                        contacts: [{
-                            vcard: vcardData.content
-                        }]
+                        contacts: [kontak]
+                    },
+                    contextInfo: {
+                        forwardingScore: 999,
+                        isForwarded: false,
+                        mentionedJid: [sender],
+                        externalAdReply: {
+                            showAdAttribution: true,
+                            renderLargerThumbnail: true,
+                            title: Styles(`📇 Kontak dari file vcard.vcf`),
+                            containsAutoReply: true,
+                            mediaType: 1,
+                            jpegThumbnail: fs.existsSync(THUMB_PATH) ? fs.readFileSync(THUMB_PATH) : null,
+                            mediaUrl: `https://youtube.com/@KayyOffc`,
+                            sourceUrl: `https://youtube.com/@KayyOffc`
+                        }
                     }
-                });
+                }, { quoted: msg });
 
-                console.log(`✅ Kontak ${vcardData.displayName} berhasil dikirim`);
+                console.log(`✅ Kontak ${vcardData.displayName} terkirim`);
 
             } catch (error) {
-                console.error('❌ Error:', error);
-                await sock.sendMessage(jid, {
-                    text: '❌ Gagal mengirim kontak'
+                console.error('Error:', error);
+                await sock.sendMessage(jid, { 
+                    text: '❌ Gagal mengirim kontak: ' + error.message 
                 });
             }
+        }
+
+        // ============= COMMAND .OWNER =============
+        if (command === '.owner') {
+            try {
+                const kontak = {
+                    displayName: 'My Owner',
+                    vcard: `BEGIN:VCARD
+VERSION:3.0
+N:;;;; 
+FN:${global.ownername}
+item1.TEL;waid=${global.owner}:+${global.owner}
+item1.X-ABLabel:Owner
+URL;Email Owner:${global.ownername}@gmail.com
+ORG:INI OWNER
+END:VCARD`
+                };
+
+                await sock.sendMessage(jid, {
+                    contacts: {
+                        contacts: [kontak]
+                    },
+                    contextInfo: {
+                        forwardingScore: 999,
+                        isForwarded: false,
+                        mentionedJid: [sender],
+                        externalAdReply: {
+                            showAdAttribution: true,
+                            renderLargerThumbnail: true,
+                            title: Styles(`My Owner ${global.ownername}`),
+                            containsAutoReply: true,
+                            mediaType: 1,
+                            jpegThumbnail: fs.existsSync(THUMB_PATH) ? fs.readFileSync(THUMB_PATH) : null,
+                            mediaUrl: `https://youtube.com/@KayyOffc`,
+                            sourceUrl: `https://youtube.com/@KayyOffc`
+                        }
+                    }
+                }, { quoted: msg });
+
+                console.log(`✅ Kontak owner terkirim ke ${jid}`);
+
+            } catch (error) {
+                console.error('Error owner:', error);
+                await sock.sendMessage(jid, { 
+                    text: '❌ Gagal mengirim kontak owner' 
+                });
+            }
+        }
+
+        // ============= COMMAND .ADDPREM =============
+        if (command === '.addprem') {
+            // Cek apakah pengirim adalah owner
+            const senderNumber = sender.split('@')[0];
+            if (senderNumber !== global.owner) {
+                await sock.sendMessage(jid, { 
+                    text: '❌ Perintah ini hanya untuk owner!' 
+                });
+                return;
+            }
+
+            const targetNumber = args.split(' ')[0];
+            const duration = args.split(' ')[1] || '30';
+
+            if (!targetNumber) {
+                await sock.sendMessage(jid, { 
+                    text: '❌ Format: .addprem [nomor] [hari]\nContoh: .addprem 628123456789 30' 
+                });
+                return;
+            }
+
+            // Simulasi add premium (sesuaikan dengan database Anda)
+            await sock.sendMessage(jid, {
+                text: `✅ Berhasil menambahkan premium untuk @${targetNumber} selama ${duration} hari`,
+                mentions: [targetNumber + '@s.whatsapp.net']
+            });
+
+            console.log(`➕ Premium added: ${targetNumber} (${duration} hari)`);
         }
     }
 }
@@ -208,15 +269,27 @@ async function handleMessages(sock, messages) {
 // ============= FUNGSI UTAMA =============
 async function main() {
     console.log('='.repeat(60));
-    console.log('🤖 BOT WHATSAPP VCF - KIRIM KONTAK CARD');
+    console.log('🤖 BOT WHATSAPP VCF - VERSI TERBARU');
     console.log('='.repeat(60));
     
-    // Test vCard
-    console.log('\n📁 Memeriksa konfigurasi vCard...');
-    const testVcard = createWhatsAppVcard();
-    console.log('✅ Format vCard siap digunakan');
-    console.log('📇 Nama kontak:', testVcard.displayName);
-    console.log('📄 Preview:', testVcard.content.replace(/\n/g, ' • '));
+    // Cek file thumbnail
+    if (!fs.existsSync(THUMB_PATH)) {
+        console.log('⚠️  File thumb.jpg tidak ditemukan, buat file dummy');
+        // Buat dummy thumbnail 1x1 pixel (optional)
+        const dummyThumb = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+        fs.writeFileSync(THUMB_PATH, dummyThumb);
+    }
+
+    console.log('\n📁 Konfigurasi:');
+    console.log(`👤 Owner: ${global.ownername} (${global.owner})`);
+    console.log(`🖼️  Thumbnail: ${fs.existsSync(THUMB_PATH) ? 'Ada' : 'Tidak ada'}`);
+    
+    // Cek file vcard
+    if (fs.existsSync(VCARD_PATH)) {
+        console.log(`📇 File vcard.vcf: Ada`);
+    } else {
+        console.log(`📇 File vcard.vcf: Tidak ada (buat jika perlu)`);
+    }
 
     console.log('\n🔄 Menghubungkan ke WhatsApp...\n');
     
