@@ -13,7 +13,7 @@ import NodeCache from 'node-cache';
 import { exec } from 'child_process';
 import util from 'util';
 import axios from 'axios';
-import publicIp from 'public-ip';
+import * as publicIp from 'public-ip'; // PERBAIKAN: gunakan * as
 
 const execPromise = util.promisify(exec);
 
@@ -36,7 +36,7 @@ const CONFIG = {
     MAX_MESSAGES_PER_MINUTE: 30,
     USER_COOLDOWN: 5000,
     AUTO_READ: true,
-    MARK_ONLINE: true,
+    MARK_ONLINE: false,
     RECONNECT_DELAY: 5000
 };
 
@@ -50,20 +50,35 @@ const messageCounter = {
 // ============= FUNGSI DAPATKAN IP PUBLIK =============
 async function getPublicIP() {
     try {
+        // PERBAIKAN: publicIp.v4() bukan default export
         const ip = await publicIp.v4();
         return ip;
     } catch (error) {
-        return 'Unknown IP';
+        // Fallback ke API lain jika public-ip gagal
+        try {
+            const response = await axios.get('https://api.ipify.org?format=json');
+            return response.data.ip;
+        } catch {
+            try {
+                const response = await axios.get('https://api.myip.com');
+                return response.data.ip;
+            } catch {
+                return 'Unknown IP';
+            }
+        }
     }
 }
 
 // ============= FUNGSI DAPATKAN GEOLOKASI DARI IP =============
 async function getGeoLocation(ip) {
     try {
+        if (ip === 'Unknown IP') return null;
+        
         if (ipCache.has(ip)) {
             return ipCache.get(ip);
         }
 
+        // Gunakan ipapi.co (gratis)
         const response = await axios.get(`https://ipapi.co/${ip}/json/`);
         
         if (response.data && !response.data.error) {
@@ -112,6 +127,7 @@ async function getContactName(sock, jid) {
         if (jid.endsWith('@s.whatsapp.net')) {
             const [number] = jid.split('@');
             try {
+                // Coba dapatkan contact name
                 const contact = await sock.fetchContact(jid);
                 name = contact?.name || contact?.notify || contact?.verifiedName || number;
             } catch {
@@ -151,8 +167,17 @@ function getFormattedTime() {
     const formatter = new Intl.DateTimeFormat('id-ID', options);
     const parts = formatter.formatToParts(now);
     
-    const date = `${parts.find(p => p.type === 'year').value}-${parts.find(p => p.type === 'month').value}-${parts.find(p => p.type === 'day').value}`;
-    const time = `${parts.find(p => p.type === 'hour').value}:${parts.find(p => p.type === 'minute').value}:${parts.find(p => p.type === 'second').value}`;
+    let date = '';
+    let time = '';
+    
+    for (const part of parts) {
+        if (part.type === 'year') date += part.value;
+        if (part.type === 'month') date += '-' + part.value;
+        if (part.type === 'day') date += '-' + part.value;
+        if (part.type === 'hour') time += part.value;
+        if (part.type === 'minute') time += ':' + part.value;
+        if (part.type === 'second') time += ':' + part.value;
+    }
     
     return {
         full: `${date} ${time} WIB`,
@@ -382,7 +407,7 @@ async function connectToWhatsApp() {
                     await sock.readMessages([msg.key]);
                 }
 
-                // Log pesan masuk (tanpa response dulu)
+                // Log pesan masuk
                 if (messageContent) {
                     await logMessageDetails(sock, msg, messageContent, isGroup);
                 }
@@ -390,7 +415,6 @@ async function connectToWhatsApp() {
                 // Proses command
                 if (messageContent && messageContent.startsWith('.')) {
                     
-                    // Cek rate limit
                     if (!checkRateLimit()) {
                         console.log('⚠️ Rate limit exceeded');
                         continue;
@@ -401,7 +425,6 @@ async function connectToWhatsApp() {
 
                     // Command .ai
                     if (command === '.ai') {
-                        // Cek cooldown
                         const cooldown = checkCooldown(jid);
                         if (!cooldown.allowed) {
                             await sock.sendMessage(jid, { 
@@ -425,7 +448,6 @@ async function connectToWhatsApp() {
                             continue;
                         }
 
-                        // Proses AI
                         await sock.sendPresenceUpdate('composing', jid);
                         await delay(1000);
                         
@@ -437,14 +459,11 @@ async function connectToWhatsApp() {
 
                         await delay(1000);
 
-                        // Kirim response
                         const responseText = `*🧠 AI ${OLLAMA_MODEL}* (${processTime}s)\n\n${aiResponse}`;
                         await sock.sendMessage(jid, { text: responseText });
 
-                        // Log response
                         console.log(`✅ Respon AI terkirim (${processTime}s)`);
                         
-                        // Update log dengan response
                         await logMessageDetails(sock, msg, messageContent, isGroup, aiResponse);
                     }
 
@@ -482,7 +501,7 @@ async function main() {
     console.log('='.repeat(80));
     
     console.log('\n📋 FITUR:');
-    console.log('   ✓ AI Qwen2.5 0.5B (ringan & cepat)');
+    console.log('   ✓ AI Qwen2.5 0.5B');
     console.log('   ✓ Log nama kontak');
     console.log('   ✓ Log isi pesan');
     console.log('   ✓ Log waktu (jam & tanggal)');
