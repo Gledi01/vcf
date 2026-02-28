@@ -13,7 +13,7 @@ import NodeCache from 'node-cache';
 import { exec } from 'child_process';
 import util from 'util';
 import axios from 'axios';
-import * as publicIp from 'public-ip'; // PERBAIKAN: gunakan * as
+import * as publicIp from 'public-ip';
 
 const execPromise = util.promisify(exec);
 
@@ -21,7 +21,7 @@ const execPromise = util.promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SESSION_DIR = 'sessions';
-const OLLAMA_MODEL = 'Qwen3:0.6b'; // Model 0.5B (ringan)
+const OLLAMA_MODEL = 'Qwen3:0.6b';
 
 // Cache
 const msgRetryCounterCache = new NodeCache();
@@ -29,56 +29,84 @@ const logger = pino({ level: 'silent' });
 const contactCache = new Map();
 const ipCache = new Map();
 
-// Anti-block configuration
-const CONFIG = {
-    MESSAGE_DELAY: 2000,
-    GROUP_MESSAGE_DELAY: 3000,
-    MAX_MESSAGES_PER_MINUTE: 30,
-    USER_COOLDOWN: 5000,
-    AUTO_READ: true,
-    MARK_ONLINE: false,
-    RECONNECT_DELAY: 5000
-};
+// ============= FUNGSI HAPUS SESSION CORRUPT =============
+function cleanupCorruptedSessions() {
+    try {
+        if (!fs.existsSync(SESSION_DIR)) return;
+        
+        const files = fs.readdirSync(SESSION_DIR);
+        let deletedCount = 0;
+        
+        for (const file of files) {
+            // Hapus file session yang mencurigakan (ukuran 0 bytes atau corrupted)
+            if (file.startsWith('session-') && file.endsWith('.json')) {
+                const filePath = path.join(SESSION_DIR, file);
+                const stats = fs.statSync(filePath);
+                
+                // Hapus jika ukuran terlalu kecil (< 100 bytes) atau terlalu besar (> 10MB)
+                if (stats.size < 100 || stats.size > 10 * 1024 * 1024) {
+                    fs.unlinkSync(filePath);
+                    console.log(`🗑️  Hapus session corrupt: ${file}`);
+                    deletedCount++;
+                }
+            }
+        }
+        
+        if (deletedCount > 0) {
+            console.log(`✅ Berhasil hapus ${deletedCount} session corrupt`);
+        }
+        
+        // Simpan timestamp cleanup
+        fs.writeFileSync(
+            path.join(SESSION_DIR, 'last_cleanup.txt'), 
+            new Date().toISOString()
+        );
+        
+    } catch (error) {
+        console.error('❌ Error cleanup sessions:', error.message);
+    }
+}
 
-// Cache untuk cooldown
-const userCooldown = new Map();
-const messageCounter = {
-    count: 0,
-    resetTime: Date.now() + 60000
-};
+// ============= FUNGSI DETEKSI BAD MAC LOOP =============
+const badMacTracker = new Map();
 
-// ============= FUNGSI DAPATKAN IP PUBLIK =============
+function isBadMacLoop(sessionId) {
+    const now = Date.now();
+    const records = badMacTracker.get(sessionId) || [];
+    
+    // Filter records dalam 5 menit terakhir
+    const recent = records.filter(time => now - time < 5 * 60 * 1000);
+    
+    if (recent.length >= 10) { // Jika 10+ error dalam 5 menit
+        return true;
+    }
+    
+    recent.push(now);
+    badMacTracker.set(sessionId, recent);
+    return false;
+}
+
+// ============= FUNGSI GET IP =============
 async function getPublicIP() {
     try {
-        // PERBAIKAN: publicIp.v4() bukan default export
         const ip = await publicIp.v4();
         return ip;
     } catch (error) {
-        // Fallback ke API lain jika public-ip gagal
         try {
             const response = await axios.get('https://api.ipify.org?format=json');
             return response.data.ip;
         } catch {
-            try {
-                const response = await axios.get('https://api.myip.com');
-                return response.data.ip;
-            } catch {
-                return 'Unknown IP';
-            }
+            return 'Unknown IP';
         }
     }
 }
 
-// ============= FUNGSI DAPATKAN GEOLOKASI DARI IP =============
+// ============= FUNGSI GET GEOLOKASI =============
 async function getGeoLocation(ip) {
     try {
         if (ip === 'Unknown IP') return null;
-        
-        if (ipCache.has(ip)) {
-            return ipCache.get(ip);
-        }
+        if (ipCache.has(ip)) return ipCache.get(ip);
 
-        // Gunakan ipapi.co (gratis)
         const response = await axios.get(`https://ipapi.co/${ip}/json/`);
         
         if (response.data && !response.data.error) {
@@ -91,50 +119,30 @@ async function getGeoLocation(ip) {
                 isp: response.data.org || 'Unknown',
                 timezone: response.data.timezone || 'Unknown'
             };
-            
             ipCache.set(ip, geoData);
             return geoData;
         }
-        
         return null;
     } catch (error) {
         return null;
     }
 }
 
-// ============= FUNGSI FORMAT GEOLOKASI =============
-function formatGeoLocation(geo) {
-    if (!geo) return '🌍 Geolokasi: Tidak tersedia';
-    
-    return `🌍 GEOLOKASI:
-   • Negara: ${geo.country}
-   • Kota: ${geo.city}
-   • Region: ${geo.region}
-   • ISP: ${geo.isp}
-   • Timezone: ${geo.timezone}
-   • Koordinat: ${geo.latitude}, ${geo.longitude}`;
-}
-
-// ============= FUNGSI DAPATKAN NAMA KONTAK =============
+// ============= FUNGSI GET NAMA KONTAK =============
 async function getContactName(sock, jid) {
     try {
-        if (contactCache.has(jid)) {
-            return contactCache.get(jid);
-        }
+        if (contactCache.has(jid)) return contactCache.get(jid);
 
         let name = 'Unknown';
-        
         if (jid.endsWith('@s.whatsapp.net')) {
             const [number] = jid.split('@');
             try {
-                // Coba dapatkan contact name
                 const contact = await sock.fetchContact(jid);
                 name = contact?.name || contact?.notify || contact?.verifiedName || number;
             } catch {
                 name = number;
             }
-        }
-        else if (jid.endsWith('@g.us')) {
+        } else if (jid.endsWith('@g.us')) {
             try {
                 const groupMetadata = await sock.groupMetadata(jid);
                 name = groupMetadata.subject || 'Unknown Group';
@@ -167,9 +175,7 @@ function getFormattedTime() {
     const formatter = new Intl.DateTimeFormat('id-ID', options);
     const parts = formatter.formatToParts(now);
     
-    let date = '';
-    let time = '';
-    
+    let date = '', time = '';
     for (const part of parts) {
         if (part.type === 'year') date += part.value;
         if (part.type === 'month') date += '-' + part.value;
@@ -179,14 +185,10 @@ function getFormattedTime() {
         if (part.type === 'second') time += ':' + part.value;
     }
     
-    return {
-        full: `${date} ${time} WIB`,
-        date,
-        time
-    };
+    return { full: `${date} ${time} WIB`, date, time };
 }
 
-// ============= FUNGSI LOG PESAN LENGKAP =============
+// ============= FUNGSI LOG PESAN =============
 async function logMessageDetails(sock, msg, messageContent, isGroup, response = null) {
     try {
         const jid = msg.key.remoteJid;
@@ -216,18 +218,18 @@ async function logMessageDetails(sock, msg, messageContent, isGroup, response = 
         console.log(`   • IP Publik: ${botIP}`);
         
         if (geoLocation) {
-            console.log(`\n${formatGeoLocation(geoLocation)}`);
+            console.log(`\n🌍 GEOLOKASI:`);
+            console.log(`   • Negara: ${geoLocation.country}`);
+            console.log(`   • Kota: ${geoLocation.city}`);
+            console.log(`   • ISP: ${geoLocation.isp}`);
         }
         
         if (response) {
             console.log(`\n🤖 RESPON AI:`);
             console.log(`   • ${response.substring(0, 100)}${response.length > 100 ? '...' : ''}`);
-            console.log(`   • Panjang: ${response.length} karakter`);
         }
         
         console.log('\n' + '═'.repeat(80) + '\n');
-        
-        return { contactName, waktu, botIP, geoLocation };
         
     } catch (error) {
         console.error('❌ Error logging:', error.message);
@@ -254,7 +256,7 @@ async function checkOllama() {
     }
 }
 
-// ============= FUNGSI GENERATE AI DENGAN EXEC =============
+// ============= FUNGSI GENERATE AI =============
 async function generateAIResponse(prompt) {
     try {
         console.log(`🤔 AI Memproses: "${prompt.substring(0, 50)}..."`);
@@ -266,63 +268,23 @@ async function generateAIResponse(prompt) {
             { timeout: 30000 }
         );
         
-        if (stderr) {
-            console.error('⚠️ Ollama stderr:', stderr);
-        }
+        if (stderr) console.error('⚠️ Ollama stderr:', stderr);
         
         return stdout.trim() || '❌ Tidak ada respons dari AI';
         
     } catch (error) {
         console.error('❌ Error Ollama:', error.message);
-        
-        if (error.message.includes('timeout')) {
-            return '❌ AI terlalu lama merespons. Coba pertanyaan yang lebih sederhana.';
-        }
-        if (error.message.includes('not found')) {
-            return '❌ Ollama tidak ditemukan. Pastikan Ollama sudah terinstall.';
-        }
         return '❌ Maaf, terjadi error. Coba lagi nanti.';
     }
 }
 
-// ============= FUNGSI CEK COOLDOWN =============
-function checkCooldown(userId) {
-    const now = Date.now();
-    const lastCommand = userCooldown.get(userId) || 0;
-    
-    if (now - lastCommand < CONFIG.USER_COOLDOWN) {
-        const remaining = Math.ceil((CONFIG.USER_COOLDOWN - (now - lastCommand)) / 1000);
-        return { allowed: false, remaining };
-    }
-    
-    userCooldown.set(userId, now);
-    return { allowed: true, remaining: 0 };
-}
-
-// ============= FUNGSI CEK RATE LIMIT =============
-function checkRateLimit() {
-    const now = Date.now();
-    
-    if (now > messageCounter.resetTime) {
-        messageCounter.count = 0;
-        messageCounter.resetTime = now + 60000;
-    }
-    
-    if (messageCounter.count >= CONFIG.MAX_MESSAGES_PER_MINUTE) {
-        return false;
-    }
-    
-    messageCounter.count++;
-    return true;
-}
-
-// ============= FUNGSI DELAY =============
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
 // ============= FUNGSI KONEKSI WHATSAPP =============
-async function connectToWhatsApp() {
+async function connectToWhatsApp(retryCount = 0) {
     console.log('\n🔄 Memulai koneksi WhatsApp...');
     
+    // Bersihkan session corrupt sebelum connect
+    cleanupCorruptedSessions();
+
     if (!fs.existsSync(SESSION_DIR)) {
         fs.mkdirSync(SESSION_DIR);
     }
@@ -337,15 +299,111 @@ async function connectToWhatsApp() {
         },
         printQRInTerminal: false,
         logger: logger,
-        browser: ['Bot AI Logger', 'Chrome', '1.0.0'],
+        browser: ['Bot AI', 'Chrome', '1.0.0'],
         version: version,
         syncFullHistory: false,
         msgRetryCounterCache,
         defaultQueryTimeoutMs: 60000,
-        markOnlineOnConnect: CONFIG.MARK_ONLINE
+        markOnlineOnConnect: false,
+        
+        // PENTING: Handle error decrypt
+        shouldIgnoreJid: (jid) => {
+            // Ignore error untuk ID tertentu jika perlu
+            return false;
+        }
     });
 
-    // Handle QR Code
+    // HANDLE ERROR DECRYPT - SOLUSI UTAMA
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        for (let msg of messages) {
+            try {
+                // Skip pesan dari bot sendiri
+                if (msg.key?.fromMe) continue;
+                
+                // Cek apakah ini pesan decrypt error
+                if (msg.messageStubType === 'ERROR_DECRYPT') {
+                    console.log('⚠️  Pesan tidak bisa didekripsi (BAD MAC), melewatkan...');
+                    
+                    // Catat session ID yang error
+                    const sessionId = msg.key?.remoteJid;
+                    if (sessionId && isBadMacLoop(sessionId)) {
+                        console.log(`🔄 Deteksi loop BAD MAC untuk ${sessionId}, membersihkan session...`);
+                        
+                        // Hapus file session yang bermasalah
+                        const files = fs.readdirSync(SESSION_DIR);
+                        for (const file of files) {
+                            if (file.includes(sessionId.replace(/[^0-9]/g, ''))) {
+                                fs.unlinkSync(path.join(SESSION_DIR, file));
+                                console.log(`🗑️  Hapus session: ${file}`);
+                            }
+                        }
+                    }
+                    
+                    continue; // Skip proses lebih lanjut
+                }
+
+                // Proses pesan normal
+                let messageContent = '';
+                if (msg.message?.conversation) {
+                    messageContent = msg.message.conversation;
+                } else if (msg.message?.extendedTextMessage?.text) {
+                    messageContent = msg.message.extendedTextMessage.text;
+                } else {
+                    continue; // Skip non-text
+                }
+
+                const jid = msg.key.remoteJid;
+                const isGroup = jid.endsWith('@g.us');
+
+                // Auto-read
+                await sock.readMessages([msg.key]);
+
+                // Log pesan
+                await logMessageDetails(sock, msg, messageContent, isGroup);
+
+                // Process command
+                if (messageContent.startsWith('.ai')) {
+                    const args = messageContent.substring(4).trim();
+                    
+                    if (!args) {
+                        await sock.sendMessage(jid, { 
+                            text: '❌ Format: .ai [pertanyaan]' 
+                        });
+                        continue;
+                    }
+
+                    if (args.toLowerCase() === 'status') {
+                        const ollamaStatus = await checkOllama();
+                        await sock.sendMessage(jid, { 
+                            text: `📊 *STATUS AI*\n\n${ollamaStatus.message}` 
+                        });
+                        continue;
+                    }
+
+                    await sock.sendPresenceUpdate('composing', jid);
+                    
+                    const startTime = Date.now();
+                    const aiResponse = await generateAIResponse(args);
+                    const processTime = ((Date.now() - startTime) / 1000).toFixed(1);
+
+                    const responseText = `*🧠 AI* (${processTime}s)\n\n${aiResponse}`;
+                    await sock.sendMessage(jid, { text: responseText });
+
+                    await logMessageDetails(sock, msg, messageContent, isGroup, aiResponse);
+                }
+
+            } catch (error) {
+                // Ignore Bad MAC error - jangan tampilkan ke user
+                if (error.message?.includes('Bad MAC')) {
+                    console.log('⚠️  Bad MAC error (diabaikan)');
+                } else {
+                    console.error('❌ Error:', error.message);
+                }
+            }
+        }
+    });
+
+    // Handle connection update
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
         
@@ -361,135 +419,27 @@ async function connectToWhatsApp() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
+            if (statusCode === 440 || statusCode === 515) {
+                console.log('⚠️  Session expired/corrupt, membersihkan...');
+                cleanupCorruptedSessions();
+            }
+            
             if (shouldReconnect) {
-                console.log(`❌ Koneksi terputus, reconnect dalam ${CONFIG.RECONNECT_DELAY/1000} detik...`);
-                setTimeout(() => connectToWhatsApp(), CONFIG.RECONNECT_DELAY);
+                const nextRetry = Math.min(5000 * (retryCount + 1), 30000);
+                console.log(`❌ Koneksi terputus, reconnect dalam ${nextRetry/1000} detik...`);
+                setTimeout(() => connectToWhatsApp(retryCount + 1), nextRetry);
             }
         } else if (connection === 'open') {
-            console.log('\n✅ BOT AI LOGGER BERHASIL TERHUBUNG!');
-            console.log(`🤖 Model AI: ${OLLAMA_MODEL}`);
-            console.log('📝 Command: .ai [pertanyaan]');
-            console.log('📝 Setiap pesan akan dilog dengan detail lengkap\n');
+            console.log('\n✅ BOT AI BERHASIL TERHUBUNG!');
+            console.log('🤖 Fitur anti-BAD MAC aktif');
             
             const botIP = await getPublicIP();
             const geo = await getGeoLocation(botIP);
-            console.log('🖥️  INFORMASI SERVER:');
-            console.log(`   • IP: ${botIP}`);
-            if (geo) {
-                console.log(`   • Lokasi: ${geo.city}, ${geo.country}`);
-                console.log(`   • ISP: ${geo.isp}`);
-            }
-            console.log('');
+            console.log(`🖥️  IP: ${botIP} | Lokasi: ${geo?.city || 'Unknown'}, ${geo?.country || 'Unknown'}\n`);
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
-    
-    // Handler pesan
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        for (let msg of messages) {
-            try {
-                if (!msg.message || msg.key?.remoteJid === 'status@broadcast') continue;
-                if (msg.key?.fromMe) continue;
-
-                let messageContent = '';
-                if (msg.message?.conversation) {
-                    messageContent = msg.message.conversation;
-                } else if (msg.message?.extendedTextMessage?.text) {
-                    messageContent = msg.message.extendedTextMessage.text;
-                }
-
-                const jid = msg.key.remoteJid;
-                const isGroup = jid.endsWith('@g.us');
-
-                // Auto-read
-                if (CONFIG.AUTO_READ && !msg.key.fromMe) {
-                    await sock.readMessages([msg.key]);
-                }
-
-                // Log pesan masuk
-                if (messageContent) {
-                    await logMessageDetails(sock, msg, messageContent, isGroup);
-                }
-
-                // Proses command
-                if (messageContent && messageContent.startsWith('.')) {
-                    
-                    if (!checkRateLimit()) {
-                        console.log('⚠️ Rate limit exceeded');
-                        continue;
-                    }
-
-                    const command = messageContent.split(' ')[0].toLowerCase();
-                    const args = messageContent.substring(command.length).trim();
-
-                    // Command .ai
-                    if (command === '.ai') {
-                        const cooldown = checkCooldown(jid);
-                        if (!cooldown.allowed) {
-                            await sock.sendMessage(jid, { 
-                                text: `⏳ Tunggu ${cooldown.remaining} detik` 
-                            });
-                            continue;
-                        }
-
-                        if (!args) {
-                            await sock.sendMessage(jid, { 
-                                text: '❌ Format: .ai [pertanyaan]' 
-                            });
-                            continue;
-                        }
-
-                        if (args.toLowerCase() === 'status') {
-                            const ollamaStatus = await checkOllama();
-                            await sock.sendMessage(jid, { 
-                                text: `📊 *STATUS AI*\n\n${ollamaStatus.message}` 
-                            });
-                            continue;
-                        }
-
-                        await sock.sendPresenceUpdate('composing', jid);
-                        await delay(1000);
-                        
-                        await sock.sendMessage(jid, { text: '⏳ Memproses...' });
-
-                        const startTime = Date.now();
-                        const aiResponse = await generateAIResponse(args);
-                        const processTime = ((Date.now() - startTime) / 1000).toFixed(1);
-
-                        await delay(1000);
-
-                        const responseText = `*🧠 AI ${OLLAMA_MODEL}* (${processTime}s)\n\n${aiResponse}`;
-                        await sock.sendMessage(jid, { text: responseText });
-
-                        console.log(`✅ Respon AI terkirim (${processTime}s)`);
-                        
-                        await logMessageDetails(sock, msg, messageContent, isGroup, aiResponse);
-                    }
-
-                    // Command .help
-                    if (command === '.help') {
-                        const helpText = `*🤖 BOT AI LOGGER*\n\n` +
-                            `*Model:* ${OLLAMA_MODEL}\n` +
-                            `*Command:*\n` +
-                            `• .ai [tanya] - Tanya AI\n` +
-                            `• .ai status - Cek status\n` +
-                            `• .help - Bantuan\n\n` +
-                            `*Fitur:*\n` +
-                            `• Log nama kontak\n` +
-                            `• Log waktu & tanggal\n` +
-                            `• Log IP server\n` +
-                            `• Log geolokasi`;
-                        
-                        await sock.sendMessage(jid, { text: helpText });
-                    }
-                }
-
-            } catch (error) {
-                console.error('❌ Error handler:', error.message);
-            }
-        }
-    });
 
     return sock;
 }
@@ -497,28 +447,17 @@ async function connectToWhatsApp() {
 // ============= FUNGSI UTAMA =============
 async function main() {
     console.log('='.repeat(80));
-    console.log('🤖 BOT WHATSAPP AI + LOGGER LENGKAP');
+    console.log('🤖 BOT WHATSAPP AI - FIX BAD MAC ERROR');
     console.log('='.repeat(80));
     
-    console.log('\n📋 FITUR:');
-    console.log('   ✓ AI Qwen2.5 0.5B');
-    console.log('   ✓ Log nama kontak');
-    console.log('   ✓ Log isi pesan');
-    console.log('   ✓ Log waktu (jam & tanggal)');
-    console.log('   ✓ Log IP server');
-    console.log('   ✓ Log geolokasi dari IP');
-    console.log('   ✓ Anti-block system\n');
+    // Bersihkan session sebelum mulai
+    console.log('\n🧹 Membersihkan session corrupt...');
+    cleanupCorruptedSessions();
     
-    console.log('🔍 Memeriksa Ollama...');
+    console.log('\n🔍 Memeriksa Ollama...');
     const ollamaStatus = await checkOllama();
     console.log(ollamaStatus.message);
     
-    if (!ollamaStatus.status) {
-        console.log('\n⚠️  Install Ollama dan model:');
-        console.log('   curl -fsSL https://ollama.com/install.sh | sh');
-        console.log(`   ollama pull ${OLLAMA_MODEL}\n`);
-    }
-
     console.log('\n🔄 Menghubungkan ke WhatsApp...\n');
     
     try {
@@ -529,7 +468,6 @@ async function main() {
     }
 }
 
-// Handle shutdown
 process.on('SIGINT', () => {
     console.log('\n\n👋 Bot dimatikan');
     process.exit(0);
